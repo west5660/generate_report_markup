@@ -1,0 +1,201 @@
+import math
+import os
+import re
+import asyncio
+import datetime
+import pytz
+import pandas as pd
+from urllib.parse import urlparse
+from crowd_sdk.tagme import TagmeClientAdvanced
+import sys
+
+
+class TaskHandler:
+    def __init__(self, url: str):
+        self._host = urlparse(url).netloc
+        self._org_id = urlparse(url).path.split('/')[2]
+        self._project_id = urlparse(url).path.split('/')[4]
+        self._task_id = urlparse(url).path.split('/')[6]
+
+        self.reference_data = 'referens_data/reference_data.xlsx'
+        self.client = TagmeClientAdvanced(self.get_config_path())
+
+    @staticmethod
+    def parse_reference_data(file_path):
+        try:
+            df = pd.read_excel(file_path)
+            reference_data = pd.Series(df['ANSWER'].values, index=df['FILEID']).to_dict()
+            return reference_data
+
+        except Exception as e:
+            print(f"Ошибка при разборе файла справочника: {e}")
+        return None
+
+    def get_answer_dict(reference_data):
+        answer_dict = {}
+
+        if reference_data:
+            for entry in reference_data:
+                answer_dict[int(entry['entityId'])] = entry['value']
+        return answer_dict
+
+    def get_config_path(self) -> str:
+        configs = {
+            'tagme.apps.prom-gen.sigma.sbrf.ru': '~/configs/.sigma.cfg',
+            'tagme.sberdevices.ru': '~/configs/.cloud.cfg'
+        }
+
+        return os.path.expanduser(configs[self._host])
+
+    async def get_filename(self):
+        task_info = await self.client.get_task(task_id=self._task_id,
+                                               organization_id=self._org_id)
+
+        prohibited_chars = r'[\\/*?:"<>|]'
+        cleaned_task_name = re.sub(prohibited_chars, '', f"{task_info.name}")
+
+        return f'{cleaned_task_name} {self._task_id}.xlsx'
+
+    async def get_markers_info(self) -> dict:
+        persons = await self.client.get_persons(with_organizations=True,
+                                                organization_id=self._org_id)
+
+        markers_info = {}
+
+        for person in persons:
+            if person.organizations:
+                markers_info.update({
+                    person.uid: {
+                        'email': person.email,
+                        'full_name': f'{person.last_name} {person.first_name}'
+                    }
+                })
+
+        return markers_info
+
+    async def create_report(self, cleaned_task_name):
+        task = await self.client.get_task(task_id=self._task_id,
+                                          organization_id=self._org_id)
+        overlap = task.overlap
+
+        assignments = await self.client.get_task_assignments(task_id=self._task_id,
+                                                             organization_id=self._org_id)
+
+        assignments = [assignment for assignment in assignments if assignment.result]
+        markers = await self.get_markers_info()
+
+        grouped_assignments = {}
+
+        for assignment in assignments:
+            file_name = assignment.file_name
+            if file_name not in grouped_assignments.keys():
+                grouped_assignments[file_name] = [assignment]
+            else:
+                grouped_assignments[file_name].append(assignment)
+
+        results = []
+        answer = self.parse_reference_data('reference_data/справочник.xlsx')
+        for file_name, assignment_group in grouped_assignments.items():
+            dialogue_id = assignment_group[0].result['dialogue'][0].strip().split(',', 1)[0]
+
+            file_info = {
+                'Имя файла': file_name,
+                'ID диалога': dialogue_id,
+
+            }
+            dialogue_len = len(assignment_group[0].result['dialogue'])
+            for i in range(dialogue_len):
+                phrase = assignment_group[0].result['dialogue'][i].split(',', 1)[-1].rsplit(',', 1)[0].strip()
+                file_info.update({
+                    'Фраза': phrase
+                })
+                if assignment_group[0].result['dialogue'][i].strip() != '':
+                    assignment_info = {}
+                    for j, assignment in enumerate(assignment_group):
+                        role = assignment.result['dialogue'][i].rsplit(',', 1)
+                        role = role[1] if len(role) > 1 else ''
+                        zone = pytz.timezone('Europe/Moscow')
+                        sdata = assignment.start_date.astimezone(zone)
+                        date = sdata.strftime('%Y-%m-%d %H:%M:%S')
+
+                        assignment_info.update({
+                            'Роль': role,
+                            f'Разметчик {j + 1}': markers[assignment.marker_id]['full_name'],
+                            f'Дата разметки': date
+
+                        })
+
+                        for mark in assignment.result['marks']:
+                            if mark['messageId'] == f'{dialogue_id}-{i}':
+                                if int(mark['entityId']) == 3 and 'fields' in mark and 'select' in mark['fields']:
+                                    chose_class_answer = mark['fields']['select']['value']
+                                    assignment_info.update({
+                                        f'Ответ {j + 1}': answer[int(mark['entityId'])] + f': {chose_class_answer}'}),
+                                else:
+                                    assignment_info.update({
+                                        f'Ответ {j + 1}': answer[int(mark['entityId'])],
+
+                                    })
+
+                    results.append(file_info | assignment_info)
+
+        output_folder = 'out'
+        os.makedirs(output_folder, exist_ok=True)
+        output_file = os.path.join(output_folder, f'СВОД_{cleaned_task_name}')
+
+        results_df = pd.DataFrame(results)
+        results_df = results_df[['Имя файла', 'ID диалога', 'Роль', 'Фраза',
+                                 'Разметчик 1', 'Дата разметки', 'Ответ 1', 'Разметчик 2', 'Дата разметки', 'Ответ 2',
+                                 'Разметчик 3', 'Дата разметки', 'Ответ 3']]
+
+        headers = results_df.columns.values.tolist()
+
+        markers_answers = []
+        for header in headers:
+            if 'Ответ' in header:
+                markers_answers.append(header)
+
+        def calculate_number_of_answers(row):
+            return len(markers_answers)
+
+        def calculate_consensus(row):
+            count = {}
+
+            all_empty = []
+            for marker_answer in markers_answers:
+                if row[marker_answer] == row[marker_answer]:
+                    all_empty.append(False)
+                if row[marker_answer] in count.keys():
+                    count[row[marker_answer]] += 1
+                else:
+                    count[row[marker_answer]] = 1
+
+            if False not in all_empty:
+                return 'Нет меток'
+            max_value = max(count.values())
+            count_max = sum(1 for value in count.values() if value == max_value)
+
+            cons_answer = max(count, key=count.get)
+
+            if (count_max == 1) and (max_value >= math.ceil(overlap / 2.0)) and cons_answer != '':
+                return math.floor(max_value / overlap * 100)
+            else:
+                return 0
+
+        results_df = results_df.fillna('')
+        results_df['Количество'] = results_df.apply(calculate_number_of_answers, axis=1)
+        results_df['Консенсус'] = results_df.apply(calculate_consensus, axis=1)
+
+        results_df.to_excel(output_file, index=False)
+        print(f"Данные сохранены в файл {output_file}")
+
+
+async def main():
+    task_url = input('Введите ссылку на задачу:\n')
+    task_handler = TaskHandler(task_url)
+    creat = await task_handler.get_filename()
+    await task_handler.create_report(creat)
+
+
+if __name__ == '__main__':
+    asyncio.run(main())
